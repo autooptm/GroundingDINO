@@ -12,17 +12,23 @@ from groundingdino.util import box_ops
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
+from groundingdino.util import ao_runtime as _ao
 
 
-def plot_boxes_to_image(image_pil, tgt):
+_AO_FONT = None
+
+
+def plot_boxes_to_image(image_pil, tgt, with_mask=None):
     H, W = tgt["size"]
     boxes = tgt["boxes"]
     labels = tgt["labels"]
     assert len(boxes) == len(labels), "boxes and labels must have same length"
 
     draw = ImageDraw.Draw(image_pil)
-    mask = Image.new("L", image_pil.size, 0)
-    mask_draw = ImageDraw.Draw(mask)
+    if with_mask is None:
+        with_mask = not _ao.OPT
+    mask = Image.new("L", image_pil.size, 0) if with_mask else None
+    mask_draw = ImageDraw.Draw(mask) if with_mask else None
 
     # draw boxes and masks
     for box, label in zip(boxes, labels):
@@ -40,7 +46,10 @@ def plot_boxes_to_image(image_pil, tgt):
         draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
         # draw.text((x0, y0), str(label), fill=color)
 
-        font = ImageFont.load_default()
+        global _AO_FONT
+        if _AO_FONT is None:
+            _AO_FONT = ImageFont.load_default()
+        font = _AO_FONT
         if hasattr(font, "getbbox"):
             bbox = draw.textbbox((x0, y0), str(label), font)
         else:
@@ -50,12 +59,45 @@ def plot_boxes_to_image(image_pil, tgt):
         draw.rectangle(bbox, fill=color)
         draw.text((x0, y0), str(label), fill="white")
 
-        mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
+        if mask_draw is not None:
+            mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
 
     return image_pil, mask
 
 
-def load_image(image_path):
+_AO_MEAN = [0.485, 0.456, 0.406]
+_AO_STD = [0.229, 0.224, 0.225]
+_AO_PREP = {}
+
+
+def _ao_decode_resize(image_path):
+    image_pil = Image.open(image_path).convert("RGB")
+    if "resize" not in _AO_PREP:
+        _AO_PREP["resize"] = T.RandomResize([800], max_size=1333)
+    resized, _ = _AO_PREP["resize"](image_pil, None)
+    return image_pil, resized
+
+
+def _ao_to_tensor(resized, device):
+    import numpy as np
+
+    key = ("mean", device)
+    if key not in _AO_PREP:
+        _AO_PREP[key] = torch.tensor(_AO_MEAN, device=device).view(-1, 1, 1)
+        _AO_PREP[("std", device)] = torch.tensor(_AO_STD, device=device).view(-1, 1, 1)
+    t = torch.from_numpy(np.asarray(resized, dtype=np.uint8))
+    t = t.to(device, non_blocking=True).permute(2, 0, 1).contiguous()
+    t = t.float().div(255)
+    return t.sub_(_AO_PREP[key]).div_(_AO_PREP[("std", device)])
+
+
+def load_image(image_path, device=None):
+    if _ao.OPT and device is None and torch.cuda.is_available():
+        device = "cuda"
+    if _ao.OPT and device is not None and device != "cpu":
+        image_pil, resized = _ao_decode_resize(image_path)
+        return image_pil, _ao_to_tensor(resized, device)
+
     # load image
     image_pil = Image.open(image_path).convert("RGB")  # load image
 
@@ -63,7 +105,7 @@ def load_image(image_path):
         [
             T.RandomResize([800], max_size=1333),
             T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            T.Normalize(_AO_MEAN, _AO_STD),
         ]
     )
     image, _ = transform(image_pil, None)  # 3, h, w
@@ -74,10 +116,39 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     args = SLConfig.fromfile(model_config_path)
     args.device = "cuda" if not cpu_only else "cpu"
     model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(model_checkpoint_path, map_location="cpu", weights_only=False)
     load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     print(load_res)
     _ = model.eval()
+
+    if _ao.OPT and not cpu_only and torch.cuda.is_available():
+        model = model.to("cuda")
+
+        for _lay in model.backbone[0].layers:
+            _lay.use_checkpoint = False
+        model.transformer.encoder.use_checkpoint = False
+        model.transformer.encoder.use_transformer_ckpt = False
+
+        try:
+            assert _ao.OPT_2, "AO_OPT_2=0"
+            from groundingdino.models.GroundingDINO.backbone.swin_transformer import (
+                SwinTransformerBlock,
+            )
+            from groundingdino.models.GroundingDINO.transformer import (
+                DeformableTransformerDecoderLayer,
+            )
+
+            for _cls in (SwinTransformerBlock, DeformableTransformerDecoderLayer):
+                if not getattr(_cls, "_ao_opt_done", False):
+                    _cls.forward = torch.compile(_cls.forward)
+                    _cls._ao_opt_done = True
+        except Exception:  # noqa: BLE001 -- never break inference over this
+            pass
+
+    if _ao.OPT_1:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     return model
 
 
@@ -88,7 +159,8 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     if not caption.endswith("."):
         caption = caption + "."
     device = "cuda" if not cpu_only else "cpu"
-    model = model.to(device)
+    if not _ao.OPT:
+        model = model.to(device)
     image = image.to(device)
     with torch.no_grad():
         outputs = model(image[None], captions=[caption])
@@ -97,11 +169,16 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
 
     # filter output
     if token_spans is None:
-        logits_filt = logits.cpu().clone()
-        boxes_filt = boxes.cpu().clone()
-        filt_mask = logits_filt.max(dim=1)[0] > box_threshold
-        logits_filt = logits_filt[filt_mask]  # num_filt, 256
-        boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
+        if _ao.OPT:
+            filt_mask = logits.max(dim=1)[0] > box_threshold
+            logits_filt = logits[filt_mask].float().cpu()
+            boxes_filt = boxes[filt_mask].float().cpu()
+        else:
+            logits_filt = logits.cpu().clone()
+            boxes_filt = boxes.cpu().clone()
+            filt_mask = logits_filt.max(dim=1)[0] > box_threshold
+            logits_filt = logits_filt[filt_mask]  # num_filt, 256
+            boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
 
         # get phrase
         tokenlizer = model.tokenizer
@@ -153,7 +230,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path", "-p", type=str, required=True, help="path to checkpoint file"
     )
-    parser.add_argument("--image_path", "-i", type=str, required=True, help="path to image file")
+    parser.add_argument("--image_path", "-i", type=str, nargs="+", required=True,
+                        help="path to image file(s)")
     parser.add_argument("--text_prompt", "-t", type=str, required=True, help="text prompt")
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
@@ -183,32 +261,61 @@ if __name__ == "__main__":
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
-    # load image
-    image_pil, image = load_image(image_path)
-    # load model
-    model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
 
-    # visualize raw image
-    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
+    image_paths = image_path if isinstance(image_path, list) else [image_path]
+
+    model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
 
     # set the text_threshold to None if token_spans is set.
     if token_spans is not None:
         text_threshold = None
         print("Using token_spans. Set the text_threshold to None.")
 
+    _ao_device = "cpu" if args.cpu_only else "cuda"
+    _ao_exec = None
+    _ao_next = None
+    if _ao.OPT_3 and len(image_paths) > 1:
+        from concurrent.futures import ThreadPoolExecutor
 
-    # run model
-    boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only, token_spans=eval(f"{token_spans}")
-    )
+        _ao_exec = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ao-io")
 
-    # visualize pred
-    size = image_pil.size
-    pred_dict = {
-        "boxes": boxes_filt,
-        "size": [size[1], size[0]],  # H,W
-        "labels": pred_phrases,
-    }
-    # import ipdb; ipdb.set_trace()
-    image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
-    image_with_box.save(os.path.join(output_dir, "pred.jpg"))
+    for _unit_i, image_path in enumerate(image_paths):
+        suffix = "" if len(image_paths) == 1 else "_%04d" % _unit_i
+
+        # load image
+        if _ao_exec is not None:
+            image_pil, _resized = (_ao_next or _ao_exec.submit(
+                _ao_decode_resize, image_path)).result()
+            _ao_next = (_ao_exec.submit(_ao_decode_resize, image_paths[_unit_i + 1])
+                        if _unit_i + 1 < len(image_paths) else None)
+            image = _ao_to_tensor(_resized, _ao_device)
+        else:
+            image_pil, image = load_image(image_path, device=_ao_device)
+
+        # visualize raw image
+        _raw_out = os.path.join(output_dir, "raw_image%s.jpg" % suffix)
+        _ao_raw = (_ao_exec.submit(image_pil.save, _raw_out) if _ao_exec is not None
+                   else None)
+        if _ao_raw is None:
+            image_pil.save(_raw_out)
+
+        # run model
+        boxes_filt, pred_phrases = get_grounding_output(
+            model, image, text_prompt, box_threshold, text_threshold,
+            cpu_only=args.cpu_only, token_spans=eval(f"{token_spans}")
+        )
+
+        # visualize pred
+        size = image_pil.size
+        pred_dict = {
+            "boxes": boxes_filt,
+            "size": [size[1], size[0]],  # H,W
+            "labels": pred_phrases,
+        }
+        if _ao_raw is not None:
+            _ao_raw.result()
+        image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
+        image_with_box.save(os.path.join(output_dir, "pred%s.jpg" % suffix))
+
+    if _ao_exec is not None:
+        _ao_exec.shutdown(wait=True)

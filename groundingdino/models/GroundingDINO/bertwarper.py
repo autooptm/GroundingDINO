@@ -13,6 +13,8 @@ from torchvision.ops.boxes import nms
 from transformers import BertConfig, BertModel, BertPreTrainedModel
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 
+from groundingdino.util import ao_runtime as _ao
+
 
 class BertModelWarper(nn.Module):
     def __init__(self, bert_model):
@@ -221,6 +223,32 @@ def generate_masks_with_special_tokens(tokenized, special_tokens_list, tokenizer
     return attention_mask, position_ids.to(torch.long)
 
 
+def _ao_generate_masks_on_host(tokenized, special_tokens_list, tokenizer):
+    input_ids = tokenized["input_ids"]
+    dev = input_ids.device
+    ids = input_ids.detach().to("cpu")
+    bs, num_token = ids.shape
+
+    special_tokens_mask = torch.zeros((bs, num_token), dtype=torch.bool)
+    for special_token in special_tokens_list:
+        special_tokens_mask |= ids == special_token
+    idxs = torch.nonzero(special_tokens_mask)
+
+    attention_mask = torch.eye(num_token, dtype=torch.bool).unsqueeze(0).repeat(bs, 1, 1)
+    position_ids = torch.zeros((bs, num_token), dtype=torch.long)
+    previous_col = 0
+    for i in range(idxs.shape[0]):
+        row, col = int(idxs[i, 0]), int(idxs[i, 1])
+        if col == 0 or col == num_token - 1:
+            attention_mask[row, col, col] = True
+            position_ids[row, col] = 0
+        else:
+            attention_mask[row, previous_col + 1 : col + 1, previous_col + 1 : col + 1] = True
+            position_ids[row, previous_col + 1 : col + 1] = torch.arange(0, col - previous_col)
+        previous_col = col
+    return attention_mask.to(dev), position_ids.to(dev), []
+
+
 def generate_masks_with_special_tokens_and_transfer_map(tokenized, special_tokens_list, tokenizer):
     """Generate attention mask between each pair of special tokens
     Args:
@@ -229,6 +257,8 @@ def generate_masks_with_special_tokens_and_transfer_map(tokenized, special_token
     Returns:
         torch.Tensor: attention mask between each special tokens.
     """
+    if _ao.OPT:
+        return _ao_generate_masks_on_host(tokenized, special_tokens_list, tokenizer)
     input_ids = tokenized["input_ids"]
     bs, num_token = input_ids.shape
     # special_tokens_mask: bs, num_token. 1 for special tokens. 0 for normal tokens

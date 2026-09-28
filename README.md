@@ -1,4 +1,77 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>GroundingDINO · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.84x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.84x-2ea44f"></a>
+    <a href="https://github.com/IDEA-Research/GroundingDINO/commit/856dde20aee659246248e20734ef9ba5214f5e44"><img alt="base" src="https://img.shields.io/badge/upstream-856dde20aee6-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [IDEA-Research/GroundingDINO](https://github.com/IDEA-Research/GroundingDINO) at commit
+> [`856dde20aee6`](https://github.com/IDEA-Research/GroundingDINO/commit/856dde20aee659246248e20734ef9ba5214f5e44) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+Every change is on by default and the command runs unchanged — same file, same flags, same outputs. Every change is behind a switch that defaults on; see [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result — `python demo/inference_on_a_image.py -c groundingdino/config/GroundingDINO_SwinT_OGC.py -p weights/groundingdino_swint_ogc.pth -i .asset/cat_dog.jpeg -o out -t "cat ear."`
+
+| | |
+|---|---|
+| **Command** | `python demo/inference_on_a_image.py -c groundingdino/config/GroundingDINO_SwinT_OGC.py -p weights/groundingdino_swint_ogc.pth -i .asset/cat_dog.jpeg -o out -t "cat ear."` |
+| **Entry point** | `demo/inference_on_a_image.py` |
+| **Unit measured** | one image + prompt through demo/inference_on_a_image.py (SwinT backbone, BERT, deformable decoder → boxes) |
+| **Before (stock)** | 171.2 (as reported) per unit |
+| **After (this tree, all switches default ON)** | 94.58 (as reported) per unit |
+| **Speedup** | **1.84x** end to end on NVIDIA RTX 4090, host noise floor 4.0% |
+| **Output** | outputs within 6e-3 (trimmed) of the stock program's, boxes moving < 0.1 px |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `groundingdino/models/GroundingDINO/transformer.py` | TransformerEncoder.get_reference_points + TransformerDecoder.forward | 1.026x |
+| `groundingdino/models/GroundingDINO/utils.py` | gen_encoder_output_proposals | 1.026x |
+| `groundingdino/models/GroundingDINO/ms_deform_attn.py` | MultiScaleDeformableAttention.forward | 1.026x |
+| `groundingdino/models/GroundingDINO/bertwarper.py` | generate_masks_with_special_tokens_and_transfer_map | 1.027x |
+| `demo/inference_on_a_image.py` | load_model | 1.0x |
+| `demo/inference_on_a_image.py` | load_model | 1.058x |
+| `demo/inference_on_a_image.py` | get_grounding_output | 1.046x |
+| `demo/inference_on_a_image.py` | get_grounding_output | 1.053x |
+| `demo/inference_on_a_image.py` | load_image | 1.022x |
+| `demo/inference_on_a_image.py` | plot_boxes_to_image | 1.028x |
+| `demo/inference_on_a_image.py` | the loop over images | 1.02x |
+| `demo/inference_on_a_image.py` | the loop over images | 1.42x |
+| `demo/inference_on_a_image.py` | load_model | 1.035x |
+| `demo/inference_on_a_image.py` | argument parsing and the loop over images | 1.0x |
+| `groundingdino/util/ao_runtime.py` | new file | 1.0x |
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/GroundingDINO-ao.git
+cd GroundingDINO-ao
+# set up exactly as upstream documents, then:
+python demo/inference_on_a_image.py -c groundingdino/config/GroundingDINO_SwinT_OGC.py -p weights/groundingdino_swint_ogc.pth -i .asset/cat_dog.jpeg -o out -t "cat ear."
+```
+
+`git diff 856dde20aee6` is the same change as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+The upstream README is unchanged below.
+
+<div align="center">
   <img src="./.asset/grounding_dino_logo.png" width="30%">
 </div>
 

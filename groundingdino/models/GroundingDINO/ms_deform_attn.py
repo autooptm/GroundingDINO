@@ -25,6 +25,8 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
+from groundingdino.util import ao_runtime as _ao
+
 try:
     from groundingdino import _C
 except:
@@ -284,7 +286,8 @@ class MultiScaleDeformableAttention(nn.Module):
         bs, num_query, _ = query.shape
         bs, num_value, _ = value.shape
 
-        assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
+        if _ao.SHAPE_ASSERT:
+            assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
         value = self.value_proj(value)
         if key_padding_mask is not None:

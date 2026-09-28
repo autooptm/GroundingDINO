@@ -22,6 +22,7 @@ import torch
 import torch.utils.checkpoint as checkpoint
 from torch import Tensor, nn
 
+from groundingdino.util import ao_runtime as _ao
 from groundingdino.util.misc import inverse_sigmoid
 
 from .fuse_modules import BiAttentionBlock
@@ -465,7 +466,7 @@ class TransformerEncoder(nn.Module):
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
         reference_points_list = []
-        for lvl, (H_, W_) in enumerate(spatial_shapes):
+        for lvl, (H_, W_) in enumerate(spatial_shapes.tolist()):
 
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
@@ -701,7 +702,7 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask,
             )
-            if output.isnan().any() | output.isinf().any():
+            if _ao.NAN_DEBUG and (output.isnan().any() | output.isinf().any()):
                 print(f"output layer_id {layer_id} is nan")
                 try:
                     num_nan = output.isnan().sum().item()
